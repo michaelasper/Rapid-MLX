@@ -24,9 +24,11 @@ from ..api.models import (
     Usage,
 )
 from ..api.tool_calling import (
+    ToolValidationResult,
     build_json_system_prompt,
     convert_tools_for_template,
     extract_json_schema_for_guided,
+    looks_like_malformed_tool_call,
     parse_json_output,
 )
 from ..api.utils import (
@@ -97,6 +99,69 @@ def _finalize_content_and_reasoning(
         text_to_parse = cleaned_text or raw_text
         reasoning_text, cleaned_text = reasoning_parser.extract_reasoning(text_to_parse)
     return cleaned_text, reasoning_text
+
+
+async def _run_chat_with_tool_schema_fallback(
+    *,
+    engine,
+    messages: list,
+    request: ChatCompletionRequest,
+    chat_kwargs: dict,
+    raw_request: Request,
+    timeout: float,
+    full_tools: list[dict] | None,
+    compact_tools_used: bool,
+):
+    """Run non-streaming chat and retry with full tool schemas on compact failure."""
+
+    start = time.perf_counter()
+    output = await _wait_with_disconnect(
+        engine.chat(messages=messages, **chat_kwargs),
+        raw_request,
+        timeout=timeout,
+    )
+    if output is None:
+        return None, "", None, None
+
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+    validation = None
+    if tool_calls and request.tools:
+        validation = _validate_tool_call_params(tool_calls, request.tools)
+
+    retry_needed = False
+    if compact_tools_used and full_tools:
+        invalid_tool_call = bool(
+            tool_calls and validation is not None and not validation.ok
+        )
+        malformed_tool_markup = bool(
+            not tool_calls and looks_like_malformed_tool_call(output.text)
+        )
+        if invalid_tool_call or malformed_tool_markup:
+            retry_needed = True
+
+    if not retry_needed:
+        return output, cleaned_text, tool_calls, validation or ToolValidationResult(True)
+
+    elapsed = time.perf_counter() - start
+    remaining_timeout = max(0.1, timeout - elapsed)
+    retry_kwargs = dict(chat_kwargs)
+    retry_kwargs["tools"] = full_tools
+    logger.info(
+        "Compact tool schema output failed validation/parsing; retrying with full schema"
+    )
+    retry_output = await _wait_with_disconnect(
+        engine.chat(messages=messages, **retry_kwargs),
+        raw_request,
+        timeout=remaining_timeout,
+    )
+    if retry_output is None:
+        return None, "", None, validation
+
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(retry_output.text, request)
+    validation = None
+    if tool_calls and request.tools:
+        validation = _validate_tool_call_params(tool_calls, request.tools)
+    return retry_output, cleaned_text, tool_calls, validation or ToolValidationResult(True)
 
 
 @router.post(
@@ -345,8 +410,18 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             chat_kwargs["video_max_frames"] = request.video_max_frames
 
     # Add tools if provided
+    full_tools_for_retry = None
+    compact_tools_used = False
     if request.tools:
-        chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+        full_tools_for_retry = convert_tools_for_template(request.tools, compact=False)
+        prompt_tools = convert_tools_for_template(
+            request.tools,
+            compact=not request.stream,
+        )
+        chat_kwargs["tools"] = prompt_tools
+        compact_tools_used = bool(
+            not request.stream and prompt_tools != full_tools_for_retry
+        )
 
     if request.tools or response_format:
         chat_kwargs["requires_prompt_integrity"] = True
@@ -360,7 +435,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Cloud routing: offload large-context requests to cloud LLM
     if cfg.cloud_router and not engine.is_mllm and hasattr(engine, "build_prompt"):
         try:
-            prompt = engine.build_prompt(messages, tools=request.tools)
+            prompt = engine.build_prompt(messages, tools=chat_kwargs.get("tools"))
             total_tokens, new_tokens = engine.model.estimate_new_tokens(prompt)
             if cfg.cloud_router.should_route_to_cloud(new_tokens):
                 logger.info(
@@ -465,6 +540,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     want_logprobs = request.logprobs and request.top_logprobs
     top_k_logprobs = request.top_logprobs or 0
     token_logprobs_list: list[TokenLogProb] = []
+    if want_logprobs and full_tools_for_retry:
+        # This path internally streams to collect logprobs, so it cannot safely
+        # retry after a compact-schema tool failure. Keep full schemas here.
+        chat_kwargs["tools"] = full_tools_for_retry
+        compact_tools_used = False
 
     # Check if we should use guided generation for JSON schema
     use_guided = False
@@ -475,6 +555,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             use_guided = engine.supports_guided_generation
             if use_guided:
                 logger.info("Using guided generation for JSON schema enforcement")
+
+    cleaned_text = None
+    tool_calls = None
+    tool_validation = None
 
     try:
         if want_logprobs and not use_guided:
@@ -510,10 +594,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     timeout=timeout,
                 )
         else:
-            output = await _wait_with_disconnect(
-                engine.chat(messages=messages, **chat_kwargs),
-                raw_request,
+            (
+                output,
+                cleaned_text,
+                tool_calls,
+                tool_validation,
+            ) = await _run_chat_with_tool_schema_fallback(
+                engine=engine,
+                messages=messages,
+                request=request,
+                chat_kwargs=chat_kwargs,
+                raw_request=raw_request,
                 timeout=timeout,
+                full_tools=full_tools_for_retry,
+                compact_tools_used=compact_tools_used,
             )
     except HTTPException:
         raise
@@ -544,11 +638,12 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
     # Parse tool calls from output using configured parser
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+    if cleaned_text is None:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
 
     # Validate tool call parameter values against schemas
-    if tool_calls and request.tools:
-        _validate_tool_call_params(tool_calls, request.tools)
+    if tool_validation is None and tool_calls and request.tools:
+        tool_validation = _validate_tool_call_params(tool_calls, request.tools)
 
     # Extract reasoning content. extract_reasoning() is stateless (pure regex
     # on full text), so the singleton is safe here unlike the streaming variant.

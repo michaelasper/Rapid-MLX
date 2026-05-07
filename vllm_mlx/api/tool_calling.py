@@ -15,6 +15,8 @@ import json
 import logging
 import re
 import uuid
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 from jsonschema import ValidationError, validate
@@ -22,6 +24,189 @@ from jsonschema import ValidationError, validate
 from .models import FunctionCall, ResponseFormat, ToolCall
 
 logger = logging.getLogger(__name__)
+
+_DESCRIPTION_MAX_CHARS = 240
+_EXAMPLE_MAX_CHARS = 160
+
+
+@dataclass(frozen=True)
+class ToolValidationResult:
+    """Full-schema validation result for generated tool calls."""
+
+    ok: bool
+    error: str | None = None
+
+
+def compact_json_dumps(value: Any) -> str:
+    """Render JSON without redundant whitespace."""
+
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _model_or_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return deepcopy(value)
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump(by_alias=True, exclude_none=True)
+            if isinstance(dumped, dict):
+                return dumped
+        except Exception:
+            pass
+
+    data: dict[str, Any] = {}
+    for attr in ("type", "function", "name", "description", "parameters"):
+        attr_value = getattr(value, attr, None)
+        if attr_value is None:
+            continue
+        is_mock_value = attr_value.__class__.__module__ == "unittest.mock"
+        if attr == "function":
+            data[attr] = attr_value
+            continue
+        if callable(attr_value):
+            continue
+        if is_mock_value and attr != "function":
+            continue
+        data[attr] = attr_value
+    return data
+
+
+def _collapse_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _trim_text(text: str, max_chars: int) -> str:
+    text = _collapse_whitespace(text)
+    if len(text) <= max_chars:
+        return text
+    cut = text[: max_chars - 1].rsplit(" ", 1)[0].rstrip()
+    return f"{cut}…" if cut else text[: max_chars - 1] + "…"
+
+
+def _compact_schema_value(value: Any, *, key: str | None = None) -> Any:
+    if isinstance(value, str):
+        if key == "description":
+            return _trim_text(value, _DESCRIPTION_MAX_CHARS)
+        if key in ("example", "examples"):
+            return _trim_text(value, _EXAMPLE_MAX_CHARS)
+        return value
+    if isinstance(value, list):
+        return [_compact_schema_value(item, key=key) for item in value]
+    if isinstance(value, dict):
+        return {
+            child_key: _compact_schema_value(child_value, key=child_key)
+            for child_key, child_value in value.items()
+        }
+    return value
+
+
+def _normalize_tool_definition(tool: Any, *, compact: bool) -> dict[str, Any] | None:
+    tool_dict = _model_or_dict(tool)
+    tool_type = tool_dict.get("type")
+    tool_func = tool_dict.get("function")
+    if tool_type != "function" or not tool_func:
+        return None
+
+    func = _model_or_dict(tool_func)
+    func_name = func.get("name", "")
+    func_desc = func.get("description", "")
+    func_params = func.get("parameters", {"type": "object", "properties": {}})
+
+    if compact:
+        func_desc = _trim_text(str(func_desc), _DESCRIPTION_MAX_CHARS)
+        func_params = _compact_schema_value(func_params)
+
+    return {
+        "type": "function",
+        "function": {
+            "name": func_name,
+            "description": func_desc,
+            "parameters": func_params,
+        },
+    }
+
+
+def looks_like_malformed_tool_call(text: str) -> bool:
+    """Detect outputs that appear to intend a tool call but failed parsing."""
+
+    if not text:
+        return False
+    structural_markers = (
+        "<tool_call",
+        "</tool_call",
+        "<function=",
+        "<|python_tag|>",
+        "[Calling tool:",
+    )
+    if any(marker in text for marker in structural_markers):
+        return True
+    return "{" in text and (
+        ('"name"' in text and '"arguments"' in text) or '"parameters"' in text
+    )
+
+
+def validate_tool_calls_against_tools(
+    tool_calls: list[Any] | None,
+    tools: list[Any] | None,
+) -> ToolValidationResult:
+    """Validate generated tool calls against the full original tool schemas."""
+
+    if not tool_calls:
+        return ToolValidationResult(ok=True)
+    if not tools:
+        return ToolValidationResult(ok=False, error="Tool call emitted without tools")
+
+    tool_defs: dict[str, dict[str, Any]] = {}
+    for tool in tools:
+        normalized = _normalize_tool_definition(tool, compact=False)
+        if not normalized:
+            continue
+        func = normalized["function"]
+        name = func.get("name")
+        if name:
+            tool_defs[name] = func
+
+    for tc in tool_calls:
+        func = tc.function if hasattr(tc, "function") else tc.get("function", {})
+        func_name = func.name if hasattr(func, "name") else func.get("name", "")
+        args_raw = (
+            func.arguments
+            if hasattr(func, "arguments")
+            else func.get("arguments", "{}")
+        )
+
+        if func_name not in tool_defs:
+            return ToolValidationResult(
+                ok=False,
+                error=f"Unknown tool call '{func_name}'",
+            )
+
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+        except (json.JSONDecodeError, ValueError) as e:
+            return ToolValidationResult(
+                ok=False,
+                error=f"Tool call '{func_name}' arguments is not valid JSON: {e}",
+            )
+
+        if not isinstance(args, dict):
+            return ToolValidationResult(
+                ok=False,
+                error=f"Tool call '{func_name}' arguments must be a JSON object",
+            )
+
+        schema = tool_defs[func_name].get(
+            "parameters", {"type": "object", "properties": {}}
+        )
+        try:
+            validate(instance=args, schema=schema)
+        except ValidationError as e:
+            return ToolValidationResult(
+                ok=False,
+                error=f"Tool call '{func_name}' schema validation failed: {e.message}",
+            )
+
+    return ToolValidationResult(ok=True)
 
 
 def _is_tool_call_json(obj: dict) -> bool:
@@ -333,7 +518,11 @@ def parse_tool_calls(
     return cleaned_text, tool_calls if tool_calls else None
 
 
-def convert_tools_for_template(tools: list | None) -> list[dict] | None:
+def convert_tools_for_template(
+    tools: list | None,
+    *,
+    compact: bool = True,
+) -> list[dict] | None:
     """
     Convert OpenAI tools format to format expected by tokenizer.apply_chat_template.
 
@@ -354,39 +543,9 @@ def convert_tools_for_template(tools: list | None) -> list[dict] | None:
 
     converted = []
     for tool in tools:
-        # Handle both Pydantic models and dicts
-        if isinstance(tool, dict):
-            tool_type = tool.get("type")
-            tool_func = tool.get("function")
-        else:
-            tool_type = getattr(tool, "type", None)
-            tool_func = getattr(tool, "function", None)
-
-        if tool_type == "function" and tool_func:
-            # Handle function as dict or Pydantic model
-            if isinstance(tool_func, dict):
-                func_name = tool_func.get("name", "")
-                func_desc = tool_func.get("description", "")
-                func_params = tool_func.get(
-                    "parameters", {"type": "object", "properties": {}}
-                )
-            else:
-                func_name = getattr(tool_func, "name", "")
-                func_desc = getattr(tool_func, "description", "")
-                func_params = getattr(
-                    tool_func, "parameters", {"type": "object", "properties": {}}
-                )
-
-            converted.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": func_name,
-                        "description": func_desc,
-                        "parameters": func_params,
-                    },
-                }
-            )
+        normalized = _normalize_tool_definition(tool, compact=compact)
+        if normalized:
+            converted.append(normalized)
 
     return converted if converted else None
 

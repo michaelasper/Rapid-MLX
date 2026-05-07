@@ -26,7 +26,7 @@ from ..api.models import (
     TopLogProb,
     Usage,
 )
-from ..api.tool_calling import parse_tool_calls
+from ..api.tool_calling import parse_tool_calls, validate_tool_calls_against_tools
 from ..config import get_config
 from ..engine import BaseEngine, GenerationOutput
 from ..tool_parsers import ToolParserManager
@@ -318,9 +318,14 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text, request_dict)
 
 
-def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
+def _validate_tool_call_params(tool_calls: list, tools: list):
     """Validate tool call parameter values against their schemas (post-generation)."""
     from ..api.tool_logits import _extract_param_schemas, validate_param_value
+
+    result = validate_tool_calls_against_tools(tool_calls, tools)
+    if not result.ok:
+        logger.warning(result.error)
+        return result
 
     tool_defs = [t.model_dump() if hasattr(t, "model_dump") else t for t in tools]
     schemas = _extract_param_schemas(tool_defs)
@@ -353,6 +358,12 @@ def _validate_tool_call_params(tool_calls: list, tools: list) -> None:
             is_valid, error = validate_param_value(json.dumps(param_value), schema)
             if not is_valid:
                 logger.warning(f"Tool call '{func_name}' param '{param_name}': {error}")
+                return type(result)(
+                    ok=False,
+                    error=f"Tool call '{func_name}' param '{param_name}': {error}",
+                )
+
+    return result
 
 
 # ── Message helpers ────────────────────────────────────────────────

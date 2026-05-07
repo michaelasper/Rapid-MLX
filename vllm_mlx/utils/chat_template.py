@@ -6,8 +6,9 @@ Handles enable_thinking, tools, and fallback logic for chat template rendering.
 """
 
 import copy
-import json
 import logging
+
+from ..api.tool_calling import compact_json_dumps
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +39,9 @@ def _build_tool_injection_text(tools: list[dict]) -> str:
         if desc:
             lines.append(f"{desc}")
         if props:
-            lines.append(f"Parameters: {json.dumps(props, ensure_ascii=False)}")
+            lines.append(f"Parameters: {compact_json_dumps(props)}")
         if required:
-            lines.append(f"Required: {json.dumps(required)}")
+            lines.append(f"Required: {compact_json_dumps(required)}")
         lines.append("")
 
     lines.append(
