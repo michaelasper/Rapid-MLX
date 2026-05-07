@@ -877,6 +877,25 @@ Examples:
         "Larger values may improve TTFT on Apple Silicon with sufficient memory.",
     )
     parser.add_argument(
+        "--pflash",
+        choices=["off", "auto", "always"],
+        default="off",
+        help="Enable PFlash-style long-prompt compression before prefill.",
+    )
+    parser.add_argument("--pflash-threshold", type=int, default=32768)
+    parser.add_argument("--pflash-keep-ratio", type=float, default=0.10)
+    parser.add_argument("--pflash-min-keep-tokens", type=int, default=2048)
+    parser.add_argument("--pflash-sink-tokens", type=int, default=256)
+    parser.add_argument("--pflash-tail-tokens", type=int, default=2048)
+    parser.add_argument("--pflash-block-size", type=int, default=128)
+    parser.add_argument("--pflash-query-window", type=int, default=512)
+    parser.add_argument("--pflash-stride-blocks", type=int, default=8)
+    parser.add_argument(
+        "--pflash-include-tools",
+        action="store_true",
+        help="Allow PFlash compression on prompts with tool definitions.",
+    )
+    parser.add_argument(
         "--cloud-model",
         type=str,
         default=None,
@@ -982,9 +1001,29 @@ Examples:
     # Pre-load embedding model if specified
     load_embedding_model(args.embedding_model, lock=True)
 
+    from .pflash import PFlashConfig
+    from .scheduler import SchedulerConfig
+
+    scheduler_config = SchedulerConfig(
+        prefill_step_size=args.prefill_step_size,
+        pflash_config=PFlashConfig(
+            mode=args.pflash,
+            threshold=args.pflash_threshold,
+            keep_ratio=args.pflash_keep_ratio,
+            min_keep_tokens=args.pflash_min_keep_tokens,
+            sink_tokens=args.pflash_sink_tokens,
+            tail_tokens=args.pflash_tail_tokens,
+            block_size=args.pflash_block_size,
+            query_window=args.pflash_query_window,
+            stride_blocks=args.pflash_stride_blocks,
+            skip_when_tools=not args.pflash_include_tools,
+        ),
+    )
+
     # Load model before starting server
     load_model(
         args.model,
+        scheduler_config=scheduler_config,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
         prefill_step_size=args.prefill_step_size,

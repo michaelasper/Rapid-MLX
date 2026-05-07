@@ -593,6 +593,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        has_tools = bool(kwargs.pop("has_tools", False))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -630,6 +632,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            has_tools=has_tools,
         )
 
         text = clean_output_text(output.output_text)
@@ -707,10 +710,12 @@ class BatchedEngine(BaseEngine):
         )
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
+        has_tools = bool(kwargs.pop("has_tools", False))
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            has_tools=has_tools,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -788,6 +793,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            has_tools=bool(tools),
             **kwargs,
         )
 
@@ -900,6 +906,8 @@ class BatchedEngine(BaseEngine):
         prefix_boundary = self._compute_prefix_boundary(messages, tools)
         if prefix_boundary > 0:
             kwargs["prefix_boundary"] = prefix_boundary
+        if tools:
+            kwargs["has_tools"] = True
 
         async for output in self.stream_generate(
             prompt=prompt,

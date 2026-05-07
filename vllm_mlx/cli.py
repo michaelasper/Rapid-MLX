@@ -128,6 +128,7 @@ def serve_command(args):
 
     # Import unified server
     from . import server
+    from .pflash import PFlashConfig
     from .scheduler import SchedulerConfig
     from .server import RateLimiter, app, load_model
 
@@ -145,6 +146,9 @@ def serve_command(args):
         print(
             "Error: --gpu-memory-utilization must be between 0.0 (exclusive) and 1.0 (inclusive)"
         )
+        sys.exit(1)
+    if not (0.0 < args.pflash_keep_ratio <= 1.0):
+        print("Error: --pflash-keep-ratio must be between 0.0 and 1.0")
         sys.exit(1)
 
     # Auto-detect parser config from model name when not explicitly set
@@ -260,6 +264,8 @@ def serve_command(args):
         features.append("gc-control")
     if args.pin_system_prompt:
         features.append("pin-system-prompt")
+    if args.pflash != "off":
+        features.append(f"pflash: {args.pflash}")
     if args.cors_origins:
         features.append(f"cors: {', '.join(args.cors_origins)}")
     if features:
@@ -294,7 +300,10 @@ def serve_command(args):
             "\n    For speculative decoding, use --enable-mtp (requires model with MTP head).\n"
         )
     if getattr(args, "specprefill", False):
-        print("\n  ⚠ --specprefill is deprecated and has no effect.\n")
+        print(
+            "\n  ⚠ --specprefill is deprecated and has no effect."
+            "\n    Use --pflash auto for long-prompt prefill compression.\n"
+        )
 
     # Mutual exclusion: turboquant vs standard quantization
     if args.kv_cache_turboquant and args.kv_cache_quantization:
@@ -315,6 +324,18 @@ def serve_command(args):
 
     # Build scheduler config
     enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
+    pflash_config = PFlashConfig(
+        mode=args.pflash,
+        threshold=args.pflash_threshold,
+        keep_ratio=args.pflash_keep_ratio,
+        min_keep_tokens=args.pflash_min_keep_tokens,
+        sink_tokens=args.pflash_sink_tokens,
+        tail_tokens=args.pflash_tail_tokens,
+        block_size=args.pflash_block_size,
+        query_window=args.pflash_query_window,
+        stride_blocks=args.pflash_stride_blocks,
+        skip_when_tools=not args.pflash_include_tools,
+    )
 
     scheduler_config = SchedulerConfig(
         max_num_seqs=args.max_num_seqs,
@@ -342,6 +363,8 @@ def serve_command(args):
         suffix_max_suffix_len=args.suffix_max_suffix_len,
         suffix_min_confidence=args.suffix_min_confidence,
         suffix_min_draft_len=args.suffix_min_draft_len,
+        # PFlash prompt compression
+        pflash_config=pflash_config,
         # KV cache quantization
         kv_cache_quantization=args.kv_cache_quantization,
         kv_cache_quantization_bits=args.kv_cache_quantization_bits,
@@ -363,6 +386,16 @@ def serve_command(args):
             f"SuffixDecoding: enabled, max_draft={args.suffix_max_draft}, "
             f"max_suffix={args.suffix_max_suffix_len}, "
             f"min_conf={args.suffix_min_confidence}"
+        )
+    if args.pflash != "off":
+        tool_policy = (
+            "including tool prompts"
+            if args.pflash_include_tools
+            else "skipping tool prompts"
+        )
+        print(
+            f"PFlash: mode={args.pflash}, threshold={args.pflash_threshold}, "
+            f"keep_ratio={args.pflash_keep_ratio}, {tool_policy}"
         )
     print(f"Stream interval: {args.stream_interval} tokens")
     if args.use_paged_cache:
@@ -1138,6 +1171,68 @@ Examples:
         type=str,
         default=None,
         help=argparse.SUPPRESS,
+    )
+    serve_parser.add_argument(
+        "--pflash",
+        choices=["off", "auto", "always"],
+        default="off",
+        help="Enable PFlash-style long-prompt compression before prefill "
+        "(off, auto, always; default: off).",
+    )
+    serve_parser.add_argument(
+        "--pflash-threshold",
+        type=int,
+        default=32768,
+        help="Minimum prompt tokens before --pflash auto compresses (default: 32768).",
+    )
+    serve_parser.add_argument(
+        "--pflash-keep-ratio",
+        type=float,
+        default=0.10,
+        help="Fraction of prompt tokens to keep when compressing (default: 0.10).",
+    )
+    serve_parser.add_argument(
+        "--pflash-min-keep-tokens",
+        type=int,
+        default=2048,
+        help="Minimum tokens to keep when compressing (default: 2048).",
+    )
+    serve_parser.add_argument(
+        "--pflash-sink-tokens",
+        type=int,
+        default=256,
+        help="Leading prompt tokens always kept by PFlash (default: 256).",
+    )
+    serve_parser.add_argument(
+        "--pflash-tail-tokens",
+        type=int,
+        default=2048,
+        help="Trailing prompt tokens always kept by PFlash (default: 2048).",
+    )
+    serve_parser.add_argument(
+        "--pflash-block-size",
+        type=int,
+        default=128,
+        help="Middle-token scoring block size for PFlash (default: 128).",
+    )
+    serve_parser.add_argument(
+        "--pflash-query-window",
+        type=int,
+        default=512,
+        help="Trailing query window used to score middle blocks (default: 512).",
+    )
+    serve_parser.add_argument(
+        "--pflash-stride-blocks",
+        type=int,
+        default=8,
+        help="Keep every Nth middle block as an anchor during PFlash scoring "
+        "(0 disables anchors, default: 8).",
+    )
+    serve_parser.add_argument(
+        "--pflash-include-tools",
+        action="store_true",
+        help="Allow PFlash compression on prompts with tool definitions. "
+        "By default tool prompts are skipped for tool-call reliability.",
     )
     serve_parser.add_argument(
         "--gpu-memory-utilization",

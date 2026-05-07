@@ -112,6 +112,11 @@ class Request:
     cached_tokens: int = 0  # Number of tokens retrieved from cache
     remaining_tokens: list[int] | None = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
+    has_tools: bool = False  # True when the request includes tool definitions
+
+    # PFlash prompt compression metadata
+    original_prompt_token_ids: list[int] | None = None
+    pflash_metadata: dict[str, Any] | None = None
 
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache

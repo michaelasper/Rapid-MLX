@@ -24,6 +24,7 @@ from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
 
 from .memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
 from .paged_cache import PagedCacheManager
+from .pflash import PFlashConfig, compress_request_tokens
 from .prefix_cache import BlockAwarePrefixCache, PrefixCacheManager
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .utils.decode import IncrementalDecoder
@@ -129,6 +130,9 @@ class SchedulerConfig:
     # win. Default 2 keeps chat near regression-floor while still
     # accepting most useful drafts on tool/JSON workloads.
     suffix_min_draft_len: int = 2
+
+    # PFlash-style prompt compression for faster long-prompt prefill
+    pflash_config: PFlashConfig = field(default_factory=PFlashConfig)
 
 
 @dataclass
@@ -2256,6 +2260,32 @@ class Scheduler:
             else:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
+
+        # Apply PFlash compression before prefix cache lookup.
+        if self.config.pflash_config.mode != "off" and request.prompt_token_ids:
+            original_tokens = list(request.prompt_token_ids)
+            compressed_tokens, metadata = compress_request_tokens(
+                original_tokens,
+                self.config.pflash_config,
+                has_tools=request.has_tools,
+            )
+            request.pflash_metadata = metadata
+            if metadata["compressed"]:
+                request.original_prompt_token_ids = original_tokens
+                request.prompt_token_ids = compressed_tokens
+                request.num_prompt_tokens = len(compressed_tokens)
+                request.prefix_boundary = 0
+                logger.info(
+                    f"[pflash] request={request.request_id[:12]} "
+                    f"compressed {metadata['original_tokens']} -> "
+                    f"{metadata['kept_tokens']} tokens "
+                    f"ratio={metadata['kept_tokens'] / metadata['original_tokens']:.3f}"
+                )
+            else:
+                logger.debug(
+                    f"[pflash] request={request.request_id[:12]} skipped "
+                    f"reason={metadata['reason']} tokens={metadata['original_tokens']}"
+                )
 
         # Check prefix cache for cached KV state
         if self.block_aware_cache is not None:
