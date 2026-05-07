@@ -118,6 +118,23 @@ def _check_disk_space(model_name: str, force: bool = False) -> None:
         pass
 
 
+def _build_benchmark_context(target_tokens: int) -> str:
+    """Build deterministic long context for TTFT/prefill benchmarks."""
+
+    if target_tokens <= 0:
+        return ""
+    block = (
+        "Reference context for long prompt benchmarking. "
+        "Rapid MLX evaluates prompt prefill latency, prefix cache behavior, "
+        "tool instructions, JSON schema preservation, and model output quality. "
+        "The assistant must preserve system instructions and answer only the "
+        "final user request after reviewing all reference material. "
+    )
+    approx_block_tokens = max(1, len(block.split()))
+    repeats = max(1, target_tokens // approx_block_tokens)
+    return (block * repeats).strip()
+
+
 def serve_command(args):
     """Start the OpenAI-compatible server."""
     import logging
@@ -128,7 +145,7 @@ def serve_command(args):
 
     # Import unified server
     from . import server
-    from .pflash import PFlashConfig
+    from .pflash import config_from_args, validate_model_support
     from .scheduler import SchedulerConfig
     from .server import RateLimiter, app, load_model
 
@@ -147,8 +164,17 @@ def serve_command(args):
             "Error: --gpu-memory-utilization must be between 0.0 (exclusive) and 1.0 (inclusive)"
         )
         sys.exit(1)
-    if not (0.0 < args.pflash_keep_ratio <= 1.0):
-        print("Error: --pflash-keep-ratio must be between 0.0 and 1.0")
+    try:
+        pflash_config = config_from_args(args)
+        from .api.utils import is_mllm_model
+
+        validate_model_support(
+            pflash_config,
+            model_name=args.model,
+            is_mllm=getattr(args, "mllm", False) or is_mllm_model(args.model),
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
     # Auto-detect parser config from model name when not explicitly set
@@ -324,19 +350,6 @@ def serve_command(args):
 
     # Build scheduler config
     enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
-    pflash_config = PFlashConfig(
-        mode=args.pflash,
-        threshold=args.pflash_threshold,
-        keep_ratio=args.pflash_keep_ratio,
-        min_keep_tokens=args.pflash_min_keep_tokens,
-        sink_tokens=args.pflash_sink_tokens,
-        tail_tokens=args.pflash_tail_tokens,
-        block_size=args.pflash_block_size,
-        query_window=args.pflash_query_window,
-        stride_blocks=args.pflash_stride_blocks,
-        skip_when_tools=not args.pflash_include_tools,
-    )
-
     scheduler_config = SchedulerConfig(
         max_num_seqs=args.max_num_seqs,
         prefill_batch_size=args.prefill_batch_size,
@@ -518,6 +531,7 @@ def bench_command(args):
     from mlx_lm import load
 
     from .engine_core import AsyncEngineCore, EngineConfig
+    from .pflash import config_from_args
     from .request import SamplingParams
     from .scheduler import SchedulerConfig
 
@@ -525,6 +539,11 @@ def bench_command(args):
 
     # Handle prefix cache flags
     enable_prefix_cache = args.enable_prefix_cache and not args.disable_prefix_cache
+    try:
+        pflash_config = config_from_args(args)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     async def run_benchmark():
         print(f"Loading model: {args.model}")
@@ -573,6 +592,7 @@ def bench_command(args):
             kv_cache_quantization_bits=args.kv_cache_quantization_bits,
             kv_cache_quantization_group_size=args.kv_cache_quantization_group_size,
             kv_cache_min_quantize_tokens=args.kv_cache_min_quantize_tokens,
+            pflash_config=pflash_config,
         )
         engine_config = EngineConfig(
             model_name=args.model,
@@ -600,6 +620,11 @@ def bench_command(args):
                 "travel",
             ][: args.num_prompts]
         ]
+        long_context = _build_benchmark_context(args.long_prompt_tokens)
+        if long_context:
+            prompts = [
+                f"{long_context}\n\nUser request:\n{prompt}" for prompt in prompts
+            ]
 
         params = SamplingParams(
             max_tokens=args.max_tokens,
@@ -609,10 +634,13 @@ def bench_command(args):
         print(
             f"\nRunning benchmark with {len(prompts)} prompts, max_tokens={args.max_tokens}"
         )
+        if args.long_prompt_tokens > 0:
+            print(f"Long prompt target: ~{args.long_prompt_tokens} tokens")
         print("-" * 50)
 
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        engine_stats = {}
 
         async with AsyncEngineCore(model, tokenizer, engine_config) as engine:
             await asyncio.sleep(0.1)  # Warm up
@@ -635,6 +663,7 @@ def bench_command(args):
             results = await asyncio.gather(*[get_output(r) for r in request_ids])
 
             total_time = time.perf_counter() - start_time
+            engine_stats = engine.get_stats()
 
         # Calculate stats
         for r in results:
@@ -653,6 +682,20 @@ def bench_command(args):
         print(f"  Total tokens: {total_tokens}")
         print(f"  Tokens/second: {total_completion_tokens / total_time:.2f}")
         print(f"  Throughput: {total_tokens / total_time:.2f} tok/s")
+        pflash_stats = engine_stats.get("pflash", {})
+        if pflash_stats.get("requests", 0):
+            print("  PFlash:")
+            print(f"    Requests: {pflash_stats['requests']}")
+            print(f"    Compressed: {pflash_stats['compressed_requests']}")
+            print(f"    Dropped tokens: {pflash_stats['dropped_tokens']}")
+            print(f"    Effective keep ratio: {pflash_stats['effective_keep_ratio']:.3f}")
+            print(f"    Scoring: {pflash_stats['scoring_ms']:.2f} ms")
+            if pflash_stats.get("compressed_average_ttft_s") is not None:
+                print(
+                    f"    Compressed avg TTFT: "
+                    f"{pflash_stats['compressed_average_ttft_s']:.3f}s"
+                )
+            print(f"    Prefix-boundary disabled: {pflash_stats['prefix_boundary_disabled']}")
 
     asyncio.run(run_benchmark())
 
@@ -1540,6 +1583,13 @@ Examples:
         "--max-tokens", type=int, default=100, help="Max tokens per prompt"
     )
     bench_parser.add_argument(
+        "--long-prompt-tokens",
+        type=int,
+        default=0,
+        help="Approximate reference-context tokens to prepend to each benchmark "
+        "prompt. Use with --pflash auto/always for long-prompt TTFT comparisons.",
+    )
+    bench_parser.add_argument(
         "--max-num-seqs", type=int, default=32, help="Max concurrent sequences"
     )
     bench_parser.add_argument(
@@ -1564,6 +1614,67 @@ Examples:
         type=int,
         default=100,
         help="Max entries in prefix cache (default: 100, legacy mode only)",
+    )
+    bench_parser.add_argument(
+        "--pflash",
+        choices=["off", "auto", "always"],
+        default="off",
+        help="Enable PFlash-style long-prompt compression during benchmark "
+        "(off, auto, always; default: off).",
+    )
+    bench_parser.add_argument(
+        "--pflash-threshold",
+        type=int,
+        default=32768,
+        help="Minimum prompt tokens before --pflash auto compresses (default: 32768).",
+    )
+    bench_parser.add_argument(
+        "--pflash-keep-ratio",
+        type=float,
+        default=0.10,
+        help="Fraction of prompt tokens to keep when compressing (default: 0.10).",
+    )
+    bench_parser.add_argument(
+        "--pflash-min-keep-tokens",
+        type=int,
+        default=2048,
+        help="Minimum tokens to keep when compressing (default: 2048).",
+    )
+    bench_parser.add_argument(
+        "--pflash-sink-tokens",
+        type=int,
+        default=256,
+        help="Leading prompt tokens always kept by PFlash (default: 256).",
+    )
+    bench_parser.add_argument(
+        "--pflash-tail-tokens",
+        type=int,
+        default=2048,
+        help="Trailing prompt tokens always kept by PFlash (default: 2048).",
+    )
+    bench_parser.add_argument(
+        "--pflash-block-size",
+        type=int,
+        default=128,
+        help="Middle-token scoring block size for PFlash (default: 128).",
+    )
+    bench_parser.add_argument(
+        "--pflash-query-window",
+        type=int,
+        default=512,
+        help="Trailing query window used to score middle blocks (default: 512).",
+    )
+    bench_parser.add_argument(
+        "--pflash-stride-blocks",
+        type=int,
+        default=8,
+        help="Keep every Nth middle block as an anchor during PFlash scoring "
+        "(0 disables anchors, default: 8).",
+    )
+    bench_parser.add_argument(
+        "--pflash-include-tools",
+        action="store_true",
+        help="Allow PFlash compression on prompts with tool definitions.",
     )
     # Memory-aware cache options (recommended for large models)
     bench_parser.add_argument(

@@ -13,8 +13,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from math import ceil
-from typing import Literal
-
+from typing import Any, Literal
 
 PFlashMode = Literal["off", "auto", "always"]
 
@@ -34,6 +33,28 @@ class PFlashConfig:
     stride_blocks: int = 8
     skip_when_tools: bool = True
 
+    def validate(self) -> PFlashConfig:
+        """Validate configuration values shared by CLI, server, and tests."""
+        if self.mode not in ("off", "auto", "always"):
+            raise ValueError("--pflash must be one of: off, auto, always")
+        if self.threshold < 0:
+            raise ValueError("--pflash-threshold must be >= 0")
+        if not (0.0 < self.keep_ratio <= 1.0):
+            raise ValueError("--pflash-keep-ratio must be > 0.0 and <= 1.0")
+        if self.min_keep_tokens < 0:
+            raise ValueError("--pflash-min-keep-tokens must be >= 0")
+        if self.sink_tokens < 0:
+            raise ValueError("--pflash-sink-tokens must be >= 0")
+        if self.tail_tokens < 0:
+            raise ValueError("--pflash-tail-tokens must be >= 0")
+        if self.block_size <= 0:
+            raise ValueError("--pflash-block-size must be > 0")
+        if self.query_window <= 0:
+            raise ValueError("--pflash-query-window must be > 0")
+        if self.stride_blocks < 0:
+            raise ValueError("--pflash-stride-blocks must be >= 0")
+        return self
+
 
 @dataclass(frozen=True)
 class PFlashResult:
@@ -52,6 +73,38 @@ class PFlashResult:
         return self.kept_tokens / self.original_tokens
 
 
+def config_from_args(args: Any) -> PFlashConfig:
+    """Build and validate a PFlashConfig from argparse-style attributes."""
+
+    return PFlashConfig(
+        mode=args.pflash,
+        threshold=args.pflash_threshold,
+        keep_ratio=args.pflash_keep_ratio,
+        min_keep_tokens=args.pflash_min_keep_tokens,
+        sink_tokens=args.pflash_sink_tokens,
+        tail_tokens=args.pflash_tail_tokens,
+        block_size=args.pflash_block_size,
+        query_window=args.pflash_query_window,
+        stride_blocks=args.pflash_stride_blocks,
+        skip_when_tools=not getattr(args, "pflash_include_tools", False),
+    ).validate()
+
+
+def validate_model_support(
+    config: PFlashConfig,
+    *,
+    model_name: str,
+    is_mllm: bool = False,
+) -> None:
+    """Reject unsupported serving combinations before they silently no-op."""
+
+    if config.mode != "off" and is_mllm:
+        raise ValueError(
+            f"--pflash is not supported for multimodal models ({model_name}); "
+            "disable --pflash for MLLM/VLM serving."
+        )
+
+
 @dataclass(frozen=True)
 class _BlockScore:
     start: int
@@ -64,6 +117,7 @@ def compress_tokens(
     config: PFlashConfig,
     *,
     has_tools: bool = False,
+    requires_prompt_integrity: bool = False,
 ) -> PFlashResult:
     """Compress a token list according to PFlash settings.
 
@@ -76,6 +130,8 @@ def compress_tokens(
     n_tokens = len(tokens)
     if config.mode == "off":
         return _unchanged(tokens, "off")
+    if requires_prompt_integrity:
+        return _unchanged(tokens, "protected_prompt")
     if config.mode == "auto" and n_tokens < config.threshold:
         return _unchanged(tokens, "threshold")
     if has_tools and config.skip_when_tools:
@@ -108,10 +164,12 @@ def compress_tokens(
         selected_tokens = 0
         for block in scored_blocks:
             block_len = block.end - block.start
-            if selected_tokens > 0 and selected_tokens + block_len > remaining_budget:
-                continue
-            keep_positions.update(range(block.start, block.end))
-            selected_tokens += block_len
+            slots = remaining_budget - selected_tokens
+            if slots <= 0:
+                break
+            take = min(block_len, slots)
+            keep_positions.update(range(block.start, block.start + take))
+            selected_tokens += take
             if selected_tokens >= remaining_budget:
                 break
 
@@ -126,15 +184,23 @@ def compress_request_tokens(
     config: PFlashConfig,
     *,
     has_tools: bool = False,
-) -> tuple[list[int], dict[str, int | bool | str]]:
+    requires_prompt_integrity: bool = False,
+) -> tuple[list[int], dict[str, int | bool | str | float]]:
     """Compress request tokens and return compact metadata for logging/state."""
 
-    result = compress_tokens(tokens, config, has_tools=has_tools)
+    result = compress_tokens(
+        tokens,
+        config,
+        has_tools=has_tools,
+        requires_prompt_integrity=requires_prompt_integrity,
+    )
     return result.tokens, {
         "compressed": result.compressed,
         "reason": result.reason,
         "original_tokens": result.original_tokens,
         "kept_tokens": result.kept_tokens,
+        "dropped_tokens": result.original_tokens - result.kept_tokens,
+        "compression_ratio": result.compression_ratio,
     }
 
 
@@ -161,8 +227,7 @@ def _score_middle_blocks(
     span = max(1, stop - start)
 
     blocks: list[_BlockScore] = []
-    block_index = 0
-    for block_start in range(start, stop, block_size):
+    for block_index, block_start in enumerate(range(start, stop, block_size)):
         block_end = min(block_start + block_size, stop)
         block = tokens[block_start:block_end]
 
@@ -173,7 +238,6 @@ def _score_middle_blocks(
 
         score = (4.0 * overlap) + rarity + (0.05 * recency) + stride_bonus
         blocks.append(_BlockScore(block_start, block_end, score))
-        block_index += 1
 
     return sorted(blocks, key=lambda item: (-item.score, item.start))
 

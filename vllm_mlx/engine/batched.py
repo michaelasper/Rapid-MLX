@@ -286,6 +286,13 @@ class BatchedEngine(BaseEngine):
         from ..mllm_scheduler import MLLMScheduler, MLLMSchedulerConfig
         from ..models.mllm import MLXMultimodalLM
 
+        pflash_config = getattr(self._scheduler_config, "pflash_config", None)
+        if pflash_config is not None and getattr(pflash_config, "mode", "off") != "off":
+            logger.warning(
+                "PFlash prompt compression is not supported for multimodal models; "
+                "MLLM requests will run without PFlash."
+            )
+
         # Load the MLLM model on a dedicated worker thread (#170 / #174 fix
         # extended to MLLM). mlx-lm 0.31.3+ tags every mx.array with the
         # calling thread's default stream, and MLLMScheduler.batch_generator
@@ -594,6 +601,9 @@ class BatchedEngine(BaseEngine):
             await self.start()
 
         has_tools = bool(kwargs.pop("has_tools", False))
+        requires_prompt_integrity = bool(
+            kwargs.pop("requires_prompt_integrity", False)
+        )
 
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
@@ -633,6 +643,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             has_tools=has_tools,
+            requires_prompt_integrity=requires_prompt_integrity,
         )
 
         text = clean_output_text(output.output_text)
@@ -711,11 +722,15 @@ class BatchedEngine(BaseEngine):
 
         prefix_boundary = kwargs.pop("prefix_boundary", 0)
         has_tools = bool(kwargs.pop("has_tools", False))
+        requires_prompt_integrity = bool(
+            kwargs.pop("requires_prompt_integrity", False)
+        )
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
             has_tools=has_tools,
+            requires_prompt_integrity=requires_prompt_integrity,
         )
 
         async for output in self._engine.stream_outputs(request_id):
@@ -774,6 +789,9 @@ class BatchedEngine(BaseEngine):
 
         # Extract enable_thinking before passing kwargs downstream
         enable_thinking = kwargs.pop("enable_thinking", None)
+        requires_prompt_integrity = bool(
+            kwargs.pop("requires_prompt_integrity", False)
+        ) or bool(tools)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -794,6 +812,7 @@ class BatchedEngine(BaseEngine):
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
             has_tools=bool(tools),
+            requires_prompt_integrity=requires_prompt_integrity,
             **kwargs,
         )
 
@@ -890,6 +909,9 @@ class BatchedEngine(BaseEngine):
 
         # Extract enable_thinking before passing kwargs downstream
         enable_thinking = kwargs.pop("enable_thinking", None)
+        requires_prompt_integrity = bool(
+            kwargs.pop("requires_prompt_integrity", False)
+        ) or bool(tools)
 
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
@@ -908,6 +930,8 @@ class BatchedEngine(BaseEngine):
             kwargs["prefix_boundary"] = prefix_boundary
         if tools:
             kwargs["has_tools"] = True
+        if requires_prompt_integrity:
+            kwargs["requires_prompt_integrity"] = True
 
         async for output in self.stream_generate(
             prompt=prompt,

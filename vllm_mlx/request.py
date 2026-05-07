@@ -96,7 +96,11 @@ class Request:
 
     # Set after tokenization
     prompt_token_ids: list[int] | None = None
+    # Logical client prompt length for usage/accounting. PFlash may compress
+    # prompt_token_ids before model prefill; this value must stay uncompressed.
     num_prompt_tokens: int = 0
+    # Actual number of prompt tokens fed to the model after prompt transforms.
+    model_prompt_tokens: int = 0
 
     # Generation state
     status: RequestStatus = RequestStatus.WAITING
@@ -113,6 +117,7 @@ class Request:
     remaining_tokens: list[int] | None = None  # Tokens still needing processing
     prefix_boundary: int = 0  # Token count for shared prefix (messages[:-1])
     has_tools: bool = False  # True when the request includes tool definitions
+    requires_prompt_integrity: bool = False  # True for schema/control prompts
 
     # PFlash prompt compression metadata
     original_prompt_token_ids: list[int] | None = None

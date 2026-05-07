@@ -7,4 +7,4 @@ run = "python -m vllm_mlx.server"
 
 [tasks.test]
 description = "Run tests"
-run = "pytest"
+run = "python -m pytest"

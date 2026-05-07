@@ -348,6 +348,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
 
+    if request.tools or response_format:
+        chat_kwargs["requires_prompt_integrity"] = True
+
     # Pass through enable_thinking if explicitly set by the client
     if request.enable_thinking is not None:
         chat_kwargs["enable_thinking"] = request.enable_thinking

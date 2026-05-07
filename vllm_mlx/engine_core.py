@@ -474,6 +474,7 @@ class EngineCore:
         videos: list[Any] | None = None,
         prefix_boundary: int = 0,
         has_tools: bool = False,
+        requires_prompt_integrity: bool = False,
     ) -> str:
         """
         Add a request for processing.
@@ -486,6 +487,7 @@ class EngineCore:
             videos: Optional videos for multimodal
             prefix_boundary: Token count for shared prefix (for cache)
             has_tools: Whether the request includes tool definitions
+            requires_prompt_integrity: Whether lossy prompt transforms must be skipped
 
         Returns:
             The request ID
@@ -504,6 +506,7 @@ class EngineCore:
             videos=videos,
             prefix_boundary=prefix_boundary,
             has_tools=has_tools,
+            requires_prompt_integrity=requires_prompt_integrity,
         )
 
         # Throttle requests for hybrid models (GatedDeltaNet + Transformer).

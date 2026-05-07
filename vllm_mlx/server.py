@@ -1001,23 +1001,22 @@ Examples:
     # Pre-load embedding model if specified
     load_embedding_model(args.embedding_model, lock=True)
 
-    from .pflash import PFlashConfig
+    from .pflash import config_from_args, validate_model_support
     from .scheduler import SchedulerConfig
+
+    try:
+        pflash_config = config_from_args(args)
+        validate_model_support(
+            pflash_config,
+            model_name=args.model,
+            is_mllm=args.mllm or is_mllm_model(args.model),
+        )
+    except ValueError as e:
+        parser.error(str(e))
 
     scheduler_config = SchedulerConfig(
         prefill_step_size=args.prefill_step_size,
-        pflash_config=PFlashConfig(
-            mode=args.pflash,
-            threshold=args.pflash_threshold,
-            keep_ratio=args.pflash_keep_ratio,
-            min_keep_tokens=args.pflash_min_keep_tokens,
-            sink_tokens=args.pflash_sink_tokens,
-            tail_tokens=args.pflash_tail_tokens,
-            block_size=args.pflash_block_size,
-            query_window=args.pflash_query_window,
-            stride_blocks=args.pflash_stride_blocks,
-            skip_when_tools=not args.pflash_include_tools,
-        ),
+        pflash_config=pflash_config,
     )
 
     # Load model before starting server

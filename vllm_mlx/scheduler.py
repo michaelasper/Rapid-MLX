@@ -12,6 +12,7 @@ The scheduler follows vLLM's design with:
 """
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -133,6 +134,110 @@ class SchedulerConfig:
 
     # PFlash-style prompt compression for faster long-prompt prefill
     pflash_config: PFlashConfig = field(default_factory=PFlashConfig)
+
+    def __post_init__(self) -> None:
+        self.pflash_config = self.pflash_config.validate()
+
+
+@dataclass
+class PFlashStats:
+    """Aggregate PFlash telemetry for status and benchmark reporting."""
+
+    requests: int = 0
+    compressed_requests: int = 0
+    skipped_requests: int = 0
+    original_tokens: int = 0
+    kept_tokens: int = 0
+    dropped_tokens: int = 0
+    scoring_seconds: float = 0.0
+    prefix_boundary_disabled: int = 0
+    cache_hits: int = 0
+    cached_tokens: int = 0
+    ttft_seconds: float = 0.0
+    ttft_observations: int = 0
+    compressed_ttft_seconds: float = 0.0
+    compressed_ttft_observations: int = 0
+    skipped_by_reason: dict[str, int] = field(default_factory=dict)
+
+    def record(self, metadata: dict[str, Any]) -> None:
+        self.requests += 1
+        compressed = bool(metadata.get("compressed", False))
+        if compressed:
+            self.compressed_requests += 1
+        else:
+            self.skipped_requests += 1
+            reason = str(metadata.get("reason", "unknown"))
+            self.skipped_by_reason[reason] = self.skipped_by_reason.get(reason, 0) + 1
+
+        original = int(metadata.get("original_tokens", 0))
+        kept = int(metadata.get("kept_tokens", original))
+        dropped = int(metadata.get("dropped_tokens", max(0, original - kept)))
+        self.original_tokens += original
+        self.kept_tokens += kept
+        self.dropped_tokens += dropped
+        self.scoring_seconds += float(metadata.get("scoring_seconds", 0.0))
+
+        if metadata.get("prefix_boundary_disabled"):
+            self.prefix_boundary_disabled += 1
+
+        cache_hit_type = metadata.get("cache_hit_type")
+        if cache_hit_type and cache_hit_type != "miss":
+            self.cache_hits += 1
+            self.cached_tokens += int(metadata.get("cached_tokens", 0))
+
+    def record_ttft(self, metadata: dict[str, Any], ttft_s: float) -> None:
+        self.ttft_seconds += ttft_s
+        self.ttft_observations += 1
+        if metadata.get("compressed"):
+            self.compressed_ttft_seconds += ttft_s
+            self.compressed_ttft_observations += 1
+
+    def to_dict(self) -> dict[str, Any]:
+        effective_keep_ratio = (
+            self.kept_tokens / self.original_tokens if self.original_tokens else 1.0
+        )
+        return {
+            "requests": self.requests,
+            "compressed_requests": self.compressed_requests,
+            "skipped_requests": self.skipped_requests,
+            "skipped_by_reason": dict(self.skipped_by_reason),
+            "original_tokens": self.original_tokens,
+            "kept_tokens": self.kept_tokens,
+            "dropped_tokens": self.dropped_tokens,
+            "effective_keep_ratio": effective_keep_ratio,
+            "effective_drop_ratio": 1.0 - effective_keep_ratio,
+            "scoring_ms": round(self.scoring_seconds * 1000.0, 3),
+            "average_scoring_ms": (
+                round((self.scoring_seconds / self.requests) * 1000.0, 3)
+                if self.requests
+                else 0.0
+            ),
+            "prefix_boundary_disabled": self.prefix_boundary_disabled,
+            "cache_hits": self.cache_hits,
+            "cached_tokens": self.cached_tokens,
+            "ttft_observations": self.ttft_observations,
+            "average_ttft_s": (
+                round(self.ttft_seconds / self.ttft_observations, 4)
+                if self.ttft_observations
+                else None
+            ),
+            "compressed_ttft_observations": self.compressed_ttft_observations,
+            "compressed_average_ttft_s": (
+                round(
+                    self.compressed_ttft_seconds
+                    / self.compressed_ttft_observations,
+                    4,
+                )
+                if self.compressed_ttft_observations
+                else None
+            ),
+            "acceptance_rate": None,
+            "acceptance_rate_note": (
+                "PFlash compresses prompt tokens before prefill; it is not "
+                "draft-token speculative decoding. Use effective_keep_ratio, "
+                "dropped_tokens, TTFT, and offline quality validation instead."
+            ),
+        }
 
 
 @dataclass
@@ -1651,7 +1756,9 @@ class Scheduler:
         # Statistics
         self.num_requests_processed = 0
         self.total_prompt_tokens = 0
+        self.total_model_prompt_tokens = 0
         self.total_completion_tokens = 0
+        self.pflash_stats = PFlashStats()
 
         # Memory management: periodic mx.clear_cache() to free Metal command buffers
         # Lower interval = less VRAM spike during generation but slight throughput cost
@@ -2261,25 +2368,46 @@ class Scheduler:
                 request.prompt_token_ids = list(request.prompt)
             request.num_prompt_tokens = len(request.prompt_token_ids)
 
+        # num_prompt_tokens is the logical client/API prompt length.  Keep a
+        # separate model_prompt_tokens counter because PFlash may replace
+        # prompt_token_ids with a shorter model input before prefill.
+        if request.prompt_token_ids is not None:
+            if request.num_prompt_tokens == 0:
+                request.num_prompt_tokens = len(request.prompt_token_ids)
+            request.model_prompt_tokens = len(request.prompt_token_ids)
+
         # Apply PFlash compression before prefix cache lookup.
         if self.config.pflash_config.mode != "off" and request.prompt_token_ids:
             original_tokens = list(request.prompt_token_ids)
+            original_prefix_boundary = request.prefix_boundary
+            scoring_start = time.monotonic()
             compressed_tokens, metadata = compress_request_tokens(
                 original_tokens,
                 self.config.pflash_config,
                 has_tools=request.has_tools,
+                requires_prompt_integrity=request.requires_prompt_integrity,
             )
+            scoring_seconds = time.monotonic() - scoring_start
+            metadata["scoring_seconds"] = scoring_seconds
+            metadata["scoring_ms"] = scoring_seconds * 1000.0
+            metadata["logical_prompt_tokens"] = len(original_tokens)
+            metadata["model_prompt_tokens"] = len(compressed_tokens)
+            metadata["prefix_boundary_original"] = original_prefix_boundary
+            metadata["prefix_boundary_disabled"] = False
             request.pflash_metadata = metadata
+            request.model_prompt_tokens = len(compressed_tokens)
             if metadata["compressed"]:
                 request.original_prompt_token_ids = original_tokens
                 request.prompt_token_ids = compressed_tokens
-                request.num_prompt_tokens = len(compressed_tokens)
-                request.prefix_boundary = 0
+                if original_prefix_boundary > 0:
+                    request.prefix_boundary = 0
+                    metadata["prefix_boundary_disabled"] = True
                 logger.info(
                     f"[pflash] request={request.request_id[:12]} "
                     f"compressed {metadata['original_tokens']} -> "
                     f"{metadata['kept_tokens']} tokens "
-                    f"ratio={metadata['kept_tokens'] / metadata['original_tokens']:.3f}"
+                    f"ratio={metadata['compression_ratio']:.3f} "
+                    f"scoring_ms={metadata['scoring_ms']:.2f}"
                 )
             else:
                 logger.debug(
@@ -2364,12 +2492,24 @@ class Scheduler:
             request.cache_hit_type = "miss"
             request.remaining_tokens = request.prompt_token_ids
 
+        if request.pflash_metadata is not None:
+            request.pflash_metadata["model_prompt_tokens"] = request.model_prompt_tokens
+            request.pflash_metadata["cache_hit_type"] = request.cache_hit_type
+            request.pflash_metadata["cached_tokens"] = request.cached_tokens
+            request.pflash_metadata["tokens_to_prefill"] = len(
+                request.remaining_tokens or []
+            )
+            request.pflash_metadata["prefix_boundary"] = request.prefix_boundary
+            self.pflash_stats.record(request.pflash_metadata)
+
         # Add to tracking
         self.requests[request.request_id] = request
         self.waiting.append(request)
 
         logger.debug(
-            f"Added request {request.request_id} with {request.num_prompt_tokens} prompt tokens"
+            f"Added request {request.request_id} with "
+            f"{request.num_prompt_tokens} logical prompt tokens "
+            f"({request.model_prompt_tokens} model input tokens)"
         )
 
     def abort_request(self, request_id: str) -> bool:
@@ -2456,6 +2596,7 @@ class Scheduler:
         if request is not None and request.num_output_tokens > 0:
             self.total_completion_tokens += request.num_output_tokens
             self.total_prompt_tokens += request.num_prompt_tokens
+            self.total_model_prompt_tokens += request.model_prompt_tokens
 
         if request is not None:
             request.set_finished(RequestStatus.FINISHED_ABORTED)
@@ -2603,6 +2744,7 @@ class Scheduler:
                 scheduled.append(request)
 
                 self.total_prompt_tokens += request.num_prompt_tokens
+                self.total_model_prompt_tokens += request.model_prompt_tokens
                 cache_info = (
                     f", {request.cached_tokens} cached"
                     if request.cached_tokens > 0
@@ -2612,6 +2754,7 @@ class Scheduler:
                 logger.info(
                     f"[schedule] request={request.request_id[:12]} uid={uid} "
                     f"prompt_tokens={request.num_prompt_tokens} "
+                    f"model_prompt_tokens={request.model_prompt_tokens} "
                     f"tokens_to_prefill={tokens_to_prefill}{cache_info} "
                     f"max_tokens={request.sampling_params.max_tokens} "
                     f"running={len(self.running)} waiting={len(self.waiting)}"
@@ -2651,6 +2794,10 @@ class Scheduler:
                 import time as _time
 
                 request.first_token_time = _time.time()
+                if request.pflash_metadata is not None:
+                    ttft_s = request.first_token_time - request.arrival_time
+                    request.pflash_metadata["ttft_s"] = ttft_s
+                    self.pflash_stats.record_ttft(request.pflash_metadata, ttft_s)
 
             # Decode the new token using IncrementalDecoder for multi-byte
             # safety (emoji, CJK). Skip stop tokens — they are not content.
@@ -2996,7 +3143,7 @@ class Scheduler:
                 scheduled = self._schedule_waiting()
                 output.scheduled_request_ids = [r.request_id for r in scheduled]
                 output.num_scheduled_tokens = sum(
-                    r.num_prompt_tokens for r in scheduled
+                    r.model_prompt_tokens for r in scheduled
                 )
 
                 # Run generation step if we have running requests
@@ -3121,6 +3268,11 @@ class Scheduler:
         now = _time.time()
         result = []
 
+        def _pflash_info(req: Request) -> dict[str, Any] | None:
+            if req.pflash_metadata is None:
+                return None
+            return dict(req.pflash_metadata)
+
         # Waiting requests
         for req in self.waiting:
             result.append(
@@ -3130,6 +3282,7 @@ class Scheduler:
                     "phase": "queued",
                     "elapsed_s": round(now - req.arrival_time, 2),
                     "prompt_tokens": req.num_prompt_tokens,
+                    "model_prompt_tokens": req.model_prompt_tokens,
                     "completion_tokens": 0,
                     "max_tokens": req.max_tokens,
                     "progress": 0.0,
@@ -3137,6 +3290,7 @@ class Scheduler:
                     "ttft_s": None,
                     "cache_hit_type": req.cache_hit_type,
                     "cached_tokens": req.cached_tokens,
+                    "pflash": _pflash_info(req),
                 }
             )
 
@@ -3170,6 +3324,7 @@ class Scheduler:
                     "phase": phase,
                     "elapsed_s": round(elapsed, 2),
                     "prompt_tokens": req.num_prompt_tokens,
+                    "model_prompt_tokens": req.model_prompt_tokens,
                     "completion_tokens": n_out,
                     "max_tokens": req.max_tokens,
                     "progress": min(progress, 1.0),
@@ -3177,6 +3332,7 @@ class Scheduler:
                     "ttft_s": ttft,
                     "cache_hit_type": req.cache_hit_type,
                     "cached_tokens": req.cached_tokens,
+                    "pflash": _pflash_info(req),
                 }
             )
 
@@ -3189,7 +3345,9 @@ class Scheduler:
             "num_running": len(self.running),
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
+            "total_model_prompt_tokens": self.total_model_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,
+            "pflash": self.pflash_stats.to_dict(),
         }
         # Include Metal memory stats
         try:
