@@ -53,8 +53,15 @@ from .models import (
     Usage,
     VideoUrl,
 )
+from .speculative_tools import (
+    SpeculativeToolMetrics,
+    SpeculativeToolPolicy,
+    SpeculativeToolTurnResult,
+    run_speculative_tool_turn,
+)
 from .tool_calling import (
     build_json_system_prompt,
+    canonical_tool_call_key,
     convert_tools_for_template,
     extract_json_from_text,
     # Structured output
@@ -131,6 +138,11 @@ __all__ = [
     # Tool calling
     "parse_tool_calls",
     "convert_tools_for_template",
+    "canonical_tool_call_key",
+    "SpeculativeToolMetrics",
+    "SpeculativeToolPolicy",
+    "SpeculativeToolTurnResult",
+    "run_speculative_tool_turn",
     # Structured output
     "parse_json_output",
     "validate_json_schema",

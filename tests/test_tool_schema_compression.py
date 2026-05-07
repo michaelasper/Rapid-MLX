@@ -2,6 +2,7 @@ import json
 
 from vllm_mlx.api.models import FunctionCall, ToolCall
 from vllm_mlx.api.tool_calling import (
+    canonical_tool_call_key,
     compact_json_dumps,
     convert_tools_for_template,
     looks_like_malformed_tool_call,
@@ -137,3 +138,41 @@ def test_malformed_tool_detection_is_marker_based():
     assert looks_like_malformed_tool_call("<tool_call>{bad json")
     assert looks_like_malformed_tool_call('[Calling tool: search_docs({"q":')
     assert not looks_like_malformed_tool_call("I can answer without a tool.")
+
+
+def test_canonical_tool_call_key_matches_equivalent_json_arguments():
+    left = _tool_call("search_docs", {"query": "mlx", "limit": 3})
+    right = _tool_call("search_docs", '{"limit":3,"query":"mlx"}')
+
+    assert canonical_tool_call_key(left) == canonical_tool_call_key(right)
+
+
+def test_canonical_tool_call_key_rejects_invalid_arguments():
+    bad = _tool_call("search_docs", '{"query":')
+
+    assert canonical_tool_call_key(bad) is None
+
+
+def test_canonical_tool_call_key_keeps_tool_name_and_arguments_distinct():
+    search = _tool_call("search_docs", {"query": "mlx", "limit": 3})
+    weather = _tool_call("get_weather", {"query": "mlx", "limit": 3})
+    other_args = _tool_call("search_docs", {"query": "mlx", "limit": 5})
+
+    assert canonical_tool_call_key(search) != canonical_tool_call_key(weather)
+    assert canonical_tool_call_key(search) != canonical_tool_call_key(other_args)
+
+
+def test_canonical_tool_call_key_accepts_raw_qwen_parser_dict_shape():
+    raw_parser_tool_call = {
+        "id": "call_1",
+        "name": "read_file",
+        "arguments": '{"limit":100,"path":"README.md"}',
+    }
+    openai_tool_call = _tool_call(
+        "read_file",
+        {"path": "README.md", "limit": 100},
+    )
+
+    assert canonical_tool_call_key(raw_parser_tool_call) == canonical_tool_call_key(
+        openai_tool_call
+    )

@@ -43,6 +43,62 @@ def compact_json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _canonical_json_dumps(value: Any) -> str:
+    """Render JSON deterministically for cache keys."""
+
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _extract_tool_call_parts(tool_call: Any) -> tuple[str, Any] | None:
+    if isinstance(tool_call, dict) and "function" not in tool_call:
+        name = tool_call.get("name", "")
+        arguments = tool_call.get("arguments", "{}")
+        if not isinstance(name, str) or not name.strip():
+            return None
+        return name.strip(), arguments
+
+    func = (
+        tool_call.function
+        if hasattr(tool_call, "function")
+        else tool_call.get("function", {})
+        if isinstance(tool_call, dict)
+        else {}
+    )
+    name = func.name if hasattr(func, "name") else func.get("name", "")
+    arguments = (
+        func.arguments
+        if hasattr(func, "arguments")
+        else func.get("arguments", "{}")
+        if isinstance(func, dict)
+        else "{}"
+    )
+    if not isinstance(name, str) or not name.strip():
+        return None
+    return name.strip(), arguments
+
+
+def canonical_tool_call_key(tool_call: Any) -> str | None:
+    """Build an exact semantic cache key for a generated tool call.
+
+    The key intentionally normalizes only JSON structure and object-key order.
+    It does not fuzzy-match, coerce path strings, or infer missing arguments:
+    false cache hits are worse than misses for speculative tool execution.
+    """
+
+    parts = _extract_tool_call_parts(tool_call)
+    if parts is None:
+        return None
+    name, arguments = parts
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments or "{}")
+        except (json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    return _canonical_json_dumps({"name": name, "arguments": arguments})
+
+
 def _model_or_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return deepcopy(value)
